@@ -62,6 +62,7 @@ import org.nuxeo.ecm.platform.ec.notification.NotificationConstants;
 import org.nuxeo.ecm.quota.AbstractQuotaStatsUpdater;
 import org.nuxeo.ecm.quota.QuotaStatsInitialWork;
 import org.nuxeo.runtime.api.Framework;
+import org.nuxeo.runtime.transaction.TransactionHelper;
 
 /**
  * {@link org.nuxeo.ecm.quota.QuotaStatsUpdater} counting space used by Blobs in
@@ -77,6 +78,12 @@ public class QuotaSyncListenerChecker extends AbstractQuotaStatsUpdater {
 
     private static Log log = LogFactory.getLog(QuotaSyncListenerChecker.class);
 
+    /** @since 5.9.5 */
+    public static final int REMOVE_FACET_BATCH_SIZE = 20;
+
+    /** @since 5.9.5 */
+    public static final int UPDATE_QUOTA_BATCH_SIZE = 5;
+
     @Override
     public void computeInitialStatistics(CoreSession unrestrictedSession,
             QuotaStatsInitialWork currentWorker) {
@@ -89,23 +96,39 @@ public class QuotaSyncListenerChecker extends AbstractQuotaStatsUpdater {
             log.debug("Starting initial Quota computation");
             long total = res.size();
             log.debug("Start iteration on " + total + " items");
+
+            List<String> uuids = new ArrayList<String>();
             try {
                 for (Map<String, Serializable> r : res) {
-                    String uuid = (String) r.get("ecm:uuid");
-                    // this will force an update if the plugin was installed and
-                    // then removed
-                    try {
-                        removeFacet(unrestrictedSession, uuid);
-                    } catch (ClientException e) {
-                        log.debug("Could not remove facet for uuid : " + uuid
-                                + ", error is : " + e.getMessage());
-                    }
+                    uuids.add((String) r.get("ecm:uuid"));
                 }
             } finally {
                 res.close();
             }
+
+            long idx = 0;
+            for (String uuid : uuids) {
+                // this will force an update if the plugin was installed and
+                // then removed
+                try {
+                    removeFacet(unrestrictedSession, uuid);
+                } catch (ClientException e) {
+                    log.debug("Could not remove facet for uuid : " + uuid
+                            + ", error is : " + e.getMessage());
+                }
+                idx++;
+                if (idx % REMOVE_FACET_BATCH_SIZE == 0) {
+                    unrestrictedSession.save();
+                    if (TransactionHelper.isTransactionActive()) {
+                        TransactionHelper.commitOrRollbackTransaction();
+                        TransactionHelper.startTransaction();
+                    }
+                }
+            }
+
+
             try {
-                long idx = 0;
+                idx = 0;
                 res = unrestrictedSession.queryAndFetch(query, "NXQL");
                 for (Map<String, Serializable> r : res) {
                     String uuid = (String) r.get("ecm:uuid");
@@ -117,7 +140,14 @@ public class QuotaSyncListenerChecker extends AbstractQuotaStatsUpdater {
                                 + e.getMessage());
                     }
                     idx++;
-                    currentWorker.notifyProgress(idx++, total);
+                    if (idx % UPDATE_QUOTA_BATCH_SIZE == 0) {
+                        unrestrictedSession.save();
+                        if (TransactionHelper.isTransactionActive()) {
+                            TransactionHelper.commitOrRollbackTransaction();
+                            TransactionHelper.startTransaction();
+                        }
+                    }
+                    currentWorker.notifyProgress(idx, total);
                 }
             } finally {
                 res.close();
